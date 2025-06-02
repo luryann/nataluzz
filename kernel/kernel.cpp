@@ -73,8 +73,10 @@ extern "C" void _start(void)
     }
 
     comout("does COM work??\n");
+    comout("hello world\n");
 
-    printf("Welcome to Nataluzz \n\0");
+
+    printf("hi guys\n\0");
 
     newShell.shouldPrint = true;
     newShell.PrintPrompt();
