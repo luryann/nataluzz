@@ -28,7 +28,7 @@ void init()
     comout("TEST\n");
     comout("COM TEST 2\n");
 
-    printf("[ %sINFO %s] GDT successfully loaded at address 0x%lx\n", Green, Default);
+    printf("[ %sINFO %s] GDT successfully loaded at address 0x%lx\n", Green, DefaultGDT);
     delay(1000000);  // Small delay to introduce time between messages
 
     create_idt();
