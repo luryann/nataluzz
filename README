@@ -1,0 +1,314 @@
+nataluzz
+64bit OS written in ASM and C - POC
+
+------------------------------------------------------------
+
+1. BOOTLOADER STAGE 1 
+
+Memory address: 0x7C00
+Segment:Offset on boot: CS=0x0000, IP=0x7C00
+Size limit: 512 bytes (0x0200)
+Magic signature: 0x55AA at offset 0x1FE
+A20 enable: Write 0x02 to port 0x92 or use INT 15h AX=0x2401
+Loads stage 2 or kernel to 0x1000 or 0x100000
+Initial stack: SS=0x0000, SP=0x7C00 (or customized)
+Switches to protected mode:
+
+* Load GDT at 0x500 with 32-bit descriptors
+* Set CR0 = CR0 | 0x00000001 (PE=1)
+* Far jump to 0x08:0x00001000 or higher
+
+2. BOOTLOADER STAGE 2 (PROTECTED MODE)
+
+Execution mode: 32-bit protected mode
+GDT: 3 entries
+
+* Null (0x00), Code (0x08), Data (0x10)
+* Code: Base=0x0, Limit=0xFFFFFFFF, Access=0x9A, Flags=0xCF
+* Data: Base=0x0, Limit=0xFFFFFFFF, Access=0x92, Flags=0xCF
+  Loads kernel to 0x100000
+  Sets CR4.PAE = 1 (CR4 |= 0x00000020)
+  Sets EFER.LME = 1 (MSR 0xC0000080)
+  Sets CR3 = PML4 physical address (aligned to 0x1000)
+  Sets CR0 |= 0x80000001 (PG=1, PE=1)
+  Performs long mode far jump (jmp 0x08:kernel64_entry)
+
+3. KERNEL ENTRY (LONG MODE)
+
+Entry address: 0xFFFFFFFF80000000
+CR3: Physical address of level-4 page table (4K aligned)
+CR0: 0x80010033 (PG=1, MP=1, PE=1, WP=1, NE=1)
+CR4: 0x00000690 (PAE=1, PGE=1, OSFXSR=1, OSXMMEXCPT=1)
+EFER: 0x00000500 (LME=1, LMA=1, NXE=1)
+Interrupts disabled on entry
+Initial stack pointer: RSP=0xFFFFFFFF90000000
+Sets up full page tables (PML4, PDPT, PD, PT)
+
+4. PAGING STRUCTURE
+
+Paging mode: 4-level paging
+PML4: 512 entries (each 8 bytes)
+Each entry: bits 0–11 flags, bits 12–51 physical address
+PDPT: 4 entries for 1 GiB range (0x00000000 to 0x40000000)
+PD: 512 entries, 2 MiB pages, Page Size bit = 1
+Page entry flags:
+
+* Bit 0 (Present) = 1
+* Bit 1 (Write) = 1
+* Bit 2 (User) = 0 (kernel)
+* Bit 7 (PS - Page Size) = 1
+* Bit 63 (NX) = 0 or 1 depending on region
+
+Canonical virtual addresses:
+
+* Kernel text: 0xFFFFFFFF80000000 – 0xFFFFFFFF80200000
+* Kernel heap: 0xFFFFFFFF80200000 – 0xFFFFFFFF90000000
+* Stack top:   0xFFFFFFFF90000000
+* Stack bottom: 0xFFFFFFFF8FFFF000
+* Kernel direct map: 0xFFFF800000000000 – 0xFFFF807FFFFFFFFF
+* Physical identity map: 0x0000000000000000 – 0x0000000010000000
+
+5. GDT STRUCTURE
+
+GDT located at physical 0x500
+GDT entries:
+
+* 0x00: Null descriptor
+* 0x08: 64-bit code (base=0x0, limit=0xFFFFFFFF, access=0x9A, flags=0xA0)
+* 0x10: 64-bit data (base=0x0, limit=0xFFFFFFFF, access=0x92, flags=0xA0)
+* 0x18: TSS descriptor (64-bit, base split over 16 bytes)
+
+TSS:
+
+* Base: 0xFFFF800000100000
+* RSP0 = 0xFFFFFFFF90000000
+* IST1 = 0xFFFFFFFF90001000
+* I/O bitmap offset = 0xFFFF
+
+Load GDT: lgdt [gdtr]
+Load TSS: mov ax, 0x28; ltr ax
+
+6. IDT AND INTERRUPTS
+
+IDT: 256 entries
+Each entry: 16 bytes
+Format: offset[0:15], selector, IST, type_attr, offset[16:63], reserved
+Type_attr = 0x8E (present, DPL=0, interrupt gate)
+Vector layout:
+
+* 0x00–0x1F: CPU exceptions
+* 0x20–0x2F: IRQs (PIC remapped)
+* 0x80: Syscall (if used)
+
+Remap PIC:
+
+* Master PIC: CMD=0x20, DATA=0x21
+* Slave PIC: CMD=0xA0, DATA=0xA1
+* ICW1 = 0x11, ICW4 = 0x01
+* Master offset = 0x20, Slave offset = 0x28
+* Mask ports: 0x21, 0xA1 (bitmask to enable/disable IRQ lines)
+
+Interrupt enable: sti
+Interrupt disable: cli
+ACK IRQ: send 0x20 to port 0x20 (and 0xA0 if IRQ >= 8)
+
+Important exceptions:
+
+* #PF (Page Fault, 0x0E): Error code present
+
+  * Bit 0 = Present, Bit 1 = Write, Bit 2 = User, Bit 3 = Reserved
+  * CR2 holds faulting virtual address
+* #GP (General Protection, 0x0D)
+* #DE (Divide by zero, 0x00)
+
+7. SYSTEM CALL MECHANISM (SYSCALL/SYSRET)
+
+Used registers:
+
+* RAX = syscall number
+* RDI, RSI, RDX, R10, R8, R9 = arguments
+* RCX = return RIP
+* R11 = RFLAGS (saved automatically)
+* Return in RAX
+
+Required MSRs:
+
+* IA32_EFER (0xC0000080): set bit 0 (SYSCALL enable)
+* IA32_LSTAR (0xC0000082): 64-bit syscall entry address
+* IA32_STAR (0xC0000081):
+
+  * Bits 47:32 = user CS/SS (e.g., 0x23 << 16)
+  * Bits 63:48 = kernel CS (e.g., 0x08)
+* IA32_FMASK (0xC0000084): mask RFLAGS on syscall (e.g., disable IF)
+
+SYSCALL disables interrupts; must re-enable in handler if needed
+
+8. MULTITASKING AND SCHEDULER
+
+TSS per CPU
+Scheduler stores task state: RIP, RSP, CR3, GPRs
+Switching context:
+
+* Save: push RSP, RIP, RFLAGS, GPRs
+* Switch page table: mov to CR3
+* Load new stack, jump to saved RIP
+  Voluntary yield via syscall or interrupt
+
+Process Control Block (PCB):
+
+* pid: uint32_t
+* cr3: uint64_t
+* state: enum {READY, RUNNING, BLOCKED}
+* kernel_stack: pointer to top of kernel stack
+* user_stack: pointer to top of user-mode stack
+
+9. HEAP / PHYSICAL MEMORY
+
+Physical frame allocator: bitmap at 0x100000 or higher
+
+* Each bit = 4K page
+* Frame number = (bit index * 0x1000)
+* Frame 0 is reserved
+* Allocate by scanning for 0 and setting bit
+
+Heap allocator: bump or linked list
+
+* Kernel heap: 0xFFFFFFFF80200000 upward
+* Page-aligned allocations
+
+10. HARDWARE I/O INTERFACES
+
+Keyboard:
+
+* Data Port: 0x60
+* Status Port: 0x64
+* IRQ: 1 (mapped to vector 0x21)
+* Scancode set 1
+* Basic ASCII map, ignore key releases (scancode & 0x80)
+
+Timer (PIT):
+
+* Base frequency: 1193182 Hz
+* I/O ports: 0x40 (channel 0), 0x43 (command)
+* Mode: 0x36 = Channel 0, LSB/MSB, Mode 3
+* Example: For 100 Hz => divisor = 1193182 / 100 = 11931 (0x2E9B)
+
+Mouse (PS/2):
+
+* I/O ports: 0x60 (data), 0x64 (command)
+* IRQ: 12 (mapped to vector 0x2C)
+* Init sequence:
+
+  * Enable device: send 0xA8 to port 0x64
+  * Set sample rate, resolution
+  * Enable data reporting (0xF4)
+
+------------------------------------------------------------
+
+DISPLAY SYSTEM:
+
+The graphical user interface operates over a linear framebuffer set to a resolution of 320 pixels wide by 200 pixels tall, with 8 bits per pixel using a palette-indexed color mode. Pixel memory is written directly without GPU abstraction, and the entire frame is redrawn every refresh cycle. The framebuffer origin is the upper-left corner, with pixel rows increasing downward.
+
+The display memory is cleared each frame to a dark gray background color. All graphical elements, including windows, taskbars, and icons, are rendered explicitly on top of this base layer. No double-buffering is required unless framebuffer_swap is explicitly enabled.
+
+MOUSE INPUT:
+
+Mouse input is polled each frame via a PS/2 hardware interface. Mouse position is stored in global coordinates with origin at the top-left. Left-button state is sampled once per frame and stored in a latch to detect rising-edge transitions for click detection. No cursor is rendered. Icon and window interaction is performed using rectangular hitboxes.
+
+KEYBOARD INPUT:
+
+Keyboard input is read from PS/2 port hardware. A simplified US QWERTY keymap is used to map scan codes to ASCII characters. Key presses are processed in real-time during each GUI update cycle. Released key states are ignored. All character input is routed exclusively to the active terminal handler.
+
+WINDOW SYSTEM:
+
+The system supports a maximum of eight concurrent windows. Each window is statically allocated and managed through an indexed array. A window is defined by a rectangular area, a visibility flag, a color attribute, and a title string. All window positioning and sizing are defined in screen coordinates. No overlapping logic is implemented. Windows are non-draggable, non-resizable, and have no focus handling or stacking order. The rendering sequence draws all visible windows in the order they appear in the array.
+
+All windows are drawn as filled rectangles with an interior background and title text drawn at a fixed offset. Window elements do not contain scroll areas, input boxes, or controls.
+
+TASKBAR:
+
+A persistent taskbar is rendered at the bottom of the screen. The taskbar height is fixed at 40 pixels. It spans the full horizontal width of the display. The background color is a medium gray, and the taskbar contains a static text label with three interactive text regions corresponding to application launchers. These regions are not parsed or aligned using fonts; they are rendered as static text at known coordinates. No interaction is currently implemented beyond rendering.
+
+ICON SYSTEM:
+
+A row of desktop icons is drawn horizontally above the taskbar. Each icon is positioned at a fixed offset and occupies a 32x32 pixel region. Icons are spaced horizontally by 10 pixels. Each icon is labeled with a descriptive name rendered beneath the image. Icons are currently passive and only respond to left mouse click detection within their bounding rectangles. On first detection of a click within an icon's bounds, a corresponding window is created and added to the window manager array.
+
+The icon array supports click latching. This prevents repeated window spawning while the mouse button remains depressed across frames.
+
+APPLICATION WINDOWS:
+
+Application launch occurs by generating a new window object from a predefined template. The window is placed at a fixed vertical offset and horizontally centered on the display. The window dimensions are uniform across all applications, and no dynamic layout logic is used. Title strings are assigned based on the icon label.
+
+Once instantiated, the window is marked visible and becomes part of the rendering cycle. There is no window-level interaction or input handling beyond display.
+
+EXIT MECHANISM:
+
+One desktop icon labeled "Exit" performs a halt sequence by entering an infinite processor halt loop. This icon uses the same detection and rendering pipeline as all other icons, but triggers the halt action instead of opening a window.
+
+EVENT HANDLING:
+
+The main loop executes in a constant frame cycle. During each iteration, the following occurs in sequence:
+
+1. Poll mouse input and update position and button state.
+2. Poll keyboard input and deliver any characters to the terminal subsystem.
+3. Check for mouse interaction with icon bounds and trigger window creation on rising click.
+4. Clear framebuffer and draw the GUI frame in the following order:
+   - Background color fill
+   - Desktop icons
+   - All visible windows
+   - Taskbar with static label
+5. Flush framebuffer if swap is enabled.
+6. Loop repeats.
+
+There is no delta timing, idle tasking, or refresh throttling. The loop runs at processor speed and relies on blocking I/O cycles for pacing.
+
+COLOR DEFINITIONS:
+
+- Background color: medium-dark gray
+- Window fill color: variable per window, default is light gray
+- Title text: white
+- Taskbar color: gray
+- Taskbar label text: black
+- Icon color: light gray
+- Exit icon color: red
+- Terminal character color: monochrome black on white background
+
+MEMORY ALLOCATION:
+
+All GUI structures are statically allocated. No dynamic memory is used. The window array is fixed at compile time. Title strings and icon labels are stored in fixed-length buffers. There is no runtime font rasterization or image asset loading.
+
+BUILDING 
+
+Install 
+1. gcc,
+2. nasm,
+3. qemu-system-x86_64,
+4. qemu-uefi,
+5. xorriso,
+6. make
+
+For the Debian/Ubuntu/Distros with APT, run ``sudo apt install build-essential qemu-system-x86 xorriso``
+
+Then run ``make run`` and it will build and run the OS.
+
+TODO
+
+What I want to do: 
+- [X] Booting 
+- [X] Basic GUI 
+- [X] Mouse Detection 
+- [X] Keyboard Driver
+- [X] Terminal
+- [X] Make boot partition FAT32
+- [X] Get initrd working
+
+What I need to do:
+- [X] Load an IDT so that exceptions and interrupts can be handled.
+- [X] Memory Management 
+- [ ] Scheduler 
+- [X] Start up the other CPU cores
+- [ ] VFS
+- [ ] ELF loader
+- [ ] Userland
+
+END
